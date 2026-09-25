@@ -12,12 +12,18 @@ public final class ResizeController {
     private final Duration transitionGrace;
     private final Duration retirementDeleteDelay;
     private final TransactionRegistry transactionRegistry;
+    private final MetadataQuorum metadataQuorum;
 
     public ResizeController(
             Clock clock,
             Duration transitionGrace,
             Duration retirementDeleteDelay) {
-        this(clock, transitionGrace, retirementDeleteDelay, null);
+        this(
+                clock,
+                transitionGrace,
+                retirementDeleteDelay,
+                null,
+                new MetadataQuorum(true));
     }
 
     public ResizeController(
@@ -25,13 +31,37 @@ public final class ResizeController {
             Duration transitionGrace,
             Duration retirementDeleteDelay,
             TransactionRegistry transactionRegistry) {
+        this(
+                clock,
+                transitionGrace,
+                retirementDeleteDelay,
+                transactionRegistry,
+                new MetadataQuorum(true));
+    }
+
+    public ResizeController(
+            Clock clock,
+            Duration transitionGrace,
+            Duration retirementDeleteDelay,
+            TransactionRegistry transactionRegistry,
+            MetadataQuorum metadataQuorum) {
+
         this.clock = clock;
         this.transitionGrace = transitionGrace;
         this.retirementDeleteDelay = retirementDeleteDelay;
         this.transactionRegistry = transactionRegistry;
+        this.metadataQuorum = metadataQuorum;
     }
 
     public long resize(TopicState topic, int targetActivePartitionCount) {
+        requireQuorum();
+
+        if (topic.resizeInProgress()) {
+            throw new ResizeInProgressException(
+                    "Resize already in progress for topic "
+                            + topic.topicName());
+        }
+
         int currentActive = Math.toIntExact(topic.activePartitionCount());
 
         if (targetActivePartitionCount <= 0) {
@@ -49,6 +79,8 @@ public final class ResizeController {
     }
 
     public long shrink(TopicState topic, int targetActivePartitionCount) {
+        requireQuorum();
+
         int currentActive = Math.toIntExact(topic.activePartitionCount());
 
         if (targetActivePartitionCount <= 0
@@ -61,7 +93,9 @@ public final class ResizeController {
         Instant deadline = clock.instant().plus(transitionGrace);
 
         List<PartitionState> toTransition = topic.activePartitions().stream()
-                .sorted(Comparator.comparingInt(PartitionState::partitionId).reversed())
+                .sorted(
+                        Comparator.comparingInt(
+                                PartitionState::partitionId).reversed())
                 .limit(currentActive - targetActivePartitionCount)
                 .toList();
 
@@ -77,6 +111,8 @@ public final class ResizeController {
     }
 
     public void completeTransition(TopicState topic) {
+        requireQuorum();
+
         if (!topic.resizeInProgress()) {
             return;
         }
@@ -85,7 +121,9 @@ public final class ResizeController {
         Instant now = clock.instant();
 
         List<PartitionState> transitioning = topic.partitions().stream()
-                .filter(p -> p.lifecycleState() == PartitionLifecycleState.TRANSITIONING)
+                .filter(
+                        p -> p.lifecycleState()
+                                == PartitionLifecycleState.TRANSITIONING)
                 .toList();
 
         for (PartitionState partition : transitioning) {
@@ -99,12 +137,16 @@ public final class ResizeController {
 
             if (transactionRegistry != null
                     && transactionRegistry.hasOpenTransactionForPartition(
-                            topic.topicName(), partition.partitionId())) {
+                            topic.topicName(),
+                            partition.partitionId())) {
+
                 throw new ResizeException(
                         "Partition " + partition.partitionId()
                                 + " still has "
-                                + transactionRegistry.openTransactionCountForPartition(
-                                        topic.topicName(), partition.partitionId())
+                                + transactionRegistry
+                                        .openTransactionCountForPartition(
+                                                topic.topicName(),
+                                                partition.partitionId())
                                 + " open transaction(s)");
             }
 
@@ -122,7 +164,12 @@ public final class ResizeController {
         }
     }
 
-    public long expand(TopicState topic, int targetActivePartitionCount) {
+    public long expand(
+            TopicState topic,
+            int targetActivePartitionCount) {
+
+        requireQuorum();
+
         int currentActive = Math.toIntExact(topic.activePartitionCount());
 
         if (targetActivePartitionCount <= currentActive) {
@@ -146,35 +193,86 @@ public final class ResizeController {
 
         needed -= reactivateCount;
 
-        if (needed > 0) {
-            int nextPartitionId = topic.partitions().stream()
-                    .mapToInt(PartitionState::partitionId)
-                    .max()
-                    .orElse(-1) + 1;
+        for (int i = 0; i < needed; i++) {
+            PartitionState partition =
+                    new PartitionState(topic.allocatePartitionId());
 
-            for (int i = 0; i < needed; i++) {
-                PartitionState partition =
-                        new PartitionState(nextPartitionId + i);
-                partition.transitionTo(
-                        PartitionLifecycleState.ACTIVE,
-                        epoch,
-                        null,
-                        null);
-                topic.addPartition(partition);
-            }
+            partition.transitionTo(
+                    PartitionLifecycleState.ACTIVE,
+                    epoch,
+                    null,
+                    null);
+
+            topic.addPartition(partition);
         }
 
         topic.completeResize();
         return epoch;
     }
 
+    /**
+     * Epoch-fenced physical deletion of a retired partition.
+     */
+    public PartitionDeleteDecision deleteRetiredPartition(
+            TopicState topic,
+            int partitionId,
+            long requestedEpoch) {
+
+        requireQuorum();
+
+        final PartitionState partition;
+
+        try {
+            partition = topic.partition(partitionId);
+        } catch (IllegalArgumentException e) {
+            return PartitionDeleteDecision.REJECTED_UNKNOWN_PARTITION;
+        }
+
+        if (requestedEpoch < partition.lifecycleEpoch()) {
+            return PartitionDeleteDecision.REJECTED_STALE_EPOCH;
+        }
+
+        if (requestedEpoch > partition.lifecycleEpoch()) {
+            throw new ResizeException(
+                    "Delete epoch " + requestedEpoch
+                            + " is ahead of partition lifecycle epoch "
+                            + partition.lifecycleEpoch());
+        }
+
+        if (partition.lifecycleState()
+                != PartitionLifecycleState.RETIRED) {
+            return PartitionDeleteDecision.REJECTED_NOT_RETIRED;
+        }
+
+        Instant deadline = partition.retirementDeleteDeadline();
+
+        if (deadline == null || clock.instant().isBefore(deadline)) {
+            return PartitionDeleteDecision.REJECTED_DEADLINE_NOT_REACHED;
+        }
+
+        topic.removePartition(partitionId);
+        return PartitionDeleteDecision.DELETED;
+    }
+
     public void assertCurrentEpoch(
-            PartitionState partition, long requestedEpoch) {
+            PartitionState partition,
+            long requestedEpoch) {
+
         if (requestedEpoch < partition.lifecycleEpoch()) {
             throw new StaleResizeEpochException(
                     "Partition " + partition.partitionId()
-                            + " is owned by epoch " + partition.lifecycleEpoch()
-                            + "; stale epoch " + requestedEpoch + " rejected");
+                            + " is owned by epoch "
+                            + partition.lifecycleEpoch()
+                            + "; stale epoch "
+                            + requestedEpoch
+                            + " rejected");
+        }
+    }
+
+    private void requireQuorum() {
+        if (!metadataQuorum.isAvailable()) {
+            throw new ControllerQuorumUnavailableException(
+                    "Metadata quorum is unavailable; lifecycle state is frozen");
         }
     }
 }
