@@ -14,6 +14,9 @@ public final class TopicState {
     private Integer targetActivePartitionCount;
     private boolean resizeInProgress;
 
+    // Partition IDs are never reused after physical deletion.
+    private int nextPartitionId;
+
     public TopicState(String topicName, int partitionCount) {
         if (topicName == null || topicName.isBlank()) {
             throw new IllegalArgumentException("topicName must not be blank");
@@ -29,6 +32,8 @@ public final class TopicState {
         for (int i = 0; i < partitionCount; i++) {
             partitions.add(new PartitionState(i));
         }
+
+        this.nextPartitionId = partitionCount;
     }
 
     public String topicName() {
@@ -56,7 +61,12 @@ public final class TopicState {
                 .filter(p -> p.partitionId() == partitionId)
                 .findFirst()
                 .orElseThrow(() ->
-                        new IllegalArgumentException("Unknown partition: " + partitionId));
+                        new IllegalArgumentException(
+                                "Unknown partition: " + partitionId));
+    }
+
+    public long physicalPartitionCount() {
+        return partitions.size();
     }
 
     public long activePartitionCount() {
@@ -108,7 +118,24 @@ public final class TopicState {
         this.resizeInProgress = false;
     }
 
+    int allocatePartitionId() {
+        return nextPartitionId++;
+    }
+
     void addPartition(PartitionState partitionState) {
         partitions.add(partitionState);
+        nextPartitionId = Math.max(
+                nextPartitionId,
+                partitionState.partitionId() + 1);
+    }
+
+    void removePartition(int partitionId) {
+        boolean removed =
+                partitions.removeIf(p -> p.partitionId() == partitionId);
+
+        if (!removed) {
+            throw new IllegalArgumentException(
+                    "Unknown partition: " + partitionId);
+        }
     }
 }
