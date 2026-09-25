@@ -11,15 +11,24 @@ public final class ResizeController {
     private final Clock clock;
     private final Duration transitionGrace;
     private final Duration retirementDeleteDelay;
+    private final TransactionRegistry transactionRegistry;
 
     public ResizeController(
             Clock clock,
             Duration transitionGrace,
             Duration retirementDeleteDelay) {
+        this(clock, transitionGrace, retirementDeleteDelay, null);
+    }
 
+    public ResizeController(
+            Clock clock,
+            Duration transitionGrace,
+            Duration retirementDeleteDelay,
+            TransactionRegistry transactionRegistry) {
         this.clock = clock;
         this.transitionGrace = transitionGrace;
         this.retirementDeleteDelay = retirementDeleteDelay;
+        this.transactionRegistry = transactionRegistry;
     }
 
     public long resize(TopicState topic, int targetActivePartitionCount) {
@@ -34,11 +43,9 @@ public final class ResizeController {
             return topic.currentResizeEpoch();
         }
 
-        if (targetActivePartitionCount < currentActive) {
-            return shrink(topic, targetActivePartitionCount);
-        }
-
-        return expand(topic, targetActivePartitionCount);
+        return targetActivePartitionCount < currentActive
+                ? shrink(topic, targetActivePartitionCount)
+                : expand(topic, targetActivePartitionCount);
     }
 
     public long shrink(TopicState topic, int targetActivePartitionCount) {
@@ -90,6 +97,17 @@ public final class ResizeController {
                                 + partition.partitionId());
             }
 
+            if (transactionRegistry != null
+                    && transactionRegistry.hasOpenTransactionForPartition(
+                            topic.topicName(), partition.partitionId())) {
+                throw new ResizeException(
+                        "Partition " + partition.partitionId()
+                                + " still has "
+                                + transactionRegistry.openTransactionCountForPartition(
+                                        topic.topicName(), partition.partitionId())
+                                + " open transaction(s)");
+            }
+
             partition.transitionTo(
                     PartitionLifecycleState.RETIRED,
                     epoch,
@@ -116,12 +134,10 @@ public final class ResizeController {
         int needed = targetActivePartitionCount - currentActive;
 
         List<PartitionState> retired = topic.retiredPartitions();
-
         int reactivateCount = Math.min(needed, retired.size());
 
         for (int i = 0; i < reactivateCount; i++) {
-            PartitionState partition = retired.get(i);
-            partition.transitionTo(
+            retired.get(i).transitionTo(
                     PartitionLifecycleState.ACTIVE,
                     epoch,
                     null,
@@ -137,7 +153,8 @@ public final class ResizeController {
                     .orElse(-1) + 1;
 
             for (int i = 0; i < needed; i++) {
-                PartitionState partition = new PartitionState(nextPartitionId + i);
+                PartitionState partition =
+                        new PartitionState(nextPartitionId + i);
                 partition.transitionTo(
                         PartitionLifecycleState.ACTIVE,
                         epoch,
@@ -151,7 +168,8 @@ public final class ResizeController {
         return epoch;
     }
 
-    public void assertCurrentEpoch(PartitionState partition, long requestedEpoch) {
+    public void assertCurrentEpoch(
+            PartitionState partition, long requestedEpoch) {
         if (requestedEpoch < partition.lifecycleEpoch()) {
             throw new StaleResizeEpochException(
                     "Partition " + partition.partitionId()
